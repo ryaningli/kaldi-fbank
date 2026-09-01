@@ -1,0 +1,10 @@
+/target
+__pycache__/
+.venv/
+/data
+/pyproject.toml
+/uv.lock
+/ref/*
+!ref/fbank_cli.cc
+/results
+/.claude/

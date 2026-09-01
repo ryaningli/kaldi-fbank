@@ -1,0 +1,32 @@
+[package]
+name = "kaldi-fbank"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Pure-Rust Kaldi-compatible online FBank feature extractor"
+license = "Apache-2.0"
+repository = "https://github.com/ryaningli/kaldi-fbank"
+keywords = ["fbank", "kaldi", "asr", "audio", "knf"]
+categories = ["multimedia::audio", "science"]
+
+[lib]
+name = "kaldi_fbank"
+path = "src/lib.rs"
+
+[dependencies]
+realfft = "3.5"
+rustfft = "6.4"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+clap = { version = "4.6", features = ["derive"] }
+
+[[bench]]
+name = "fbank_bench"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
