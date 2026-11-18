@@ -27,6 +27,13 @@ pub struct FrameExtractionOptions {
     /// Value 0.00003 is equivalent to 1.0 in Kaldi.
     pub dither: f32,
     /// Preemphasis coefficient.
+    /// Preemphasis coefficient (0.0 disables it).
+    ///
+    /// The application convention follows the framing mode: with
+    /// `snip_edges` framing the reference applies it per frame (the first
+    /// sample of each frame is scaled by `1 - coeff`), while
+    /// `center == true` follows the torchaudio/NeMo convention of applying
+    /// it to the whole waveform before padding (see [`Self::center`]).
     pub preemph_coeff: f32,
     /// Subtract mean of wave before FFT.
     pub remove_dc_offset: bool,
@@ -34,6 +41,21 @@ pub struct FrameExtractionOptions {
     pub round_to_power_of_two: bool,
     pub blackman_coeff: f32,
     pub snip_edges: bool,
+    /// Torch-style centered framing (the `center=True` convention of
+    /// `torch.stft` / torchaudio / NeMo / ESPnet): zero-pad
+    /// `window_size / 2` samples at both ends so that the window of frame
+    /// `t` is centered on sample `t * frame_shift`.
+    ///
+    /// When enabled this supersedes `snip_edges` (its Kaldi framing and its
+    /// reflect-at-the-boundary behavior do not apply); boundary samples come
+    /// from zero-padding, and the frame count is `1 + num_samples /
+    /// frame_shift` after `input_finished()` — matching torchaudio's
+    /// `center=True` convention. Callers that follow NeMo's
+    /// `floor(samples / frame_shift)` convention simply drop the final frame.
+    ///
+    /// Defaults to `false` (plain Kaldi framing). This is an extension
+    /// beyond the C++ reference, which has no centered mode.
+    pub center: bool,
     /// Seed for the dithering RNG.
     ///
     /// Rust extension: the C++ reference seeds its dithering RNG
@@ -56,6 +78,7 @@ impl Default for FrameExtractionOptions {
             round_to_power_of_two: true,
             blackman_coeff: 0.42,
             snip_edges: true,
+            center: false,
             dither_seed: 27437,
         }
     }

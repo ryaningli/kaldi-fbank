@@ -82,6 +82,14 @@ pub struct OnlineFbank {
     waveform_offset: i64,
     /// Short piece of waveform kept after extracting all whole frames.
     waveform_remainder: Vec<f32>,
+    /// Waveform-level pre-emphasis state (`center` mode only): the last raw
+    /// sample of the previous chunk, or `None` before the first sample.
+    /// Centered mode follows the torchaudio/NeMo convention where
+    /// pre-emphasis runs on the whole waveform *before* zero-padding, so the
+    /// padding never participates in the difference — unlike the Kaldi
+    /// per-frame pre-emphasis, which would smear the last real sample into
+    /// the padded tail.
+    preemph_prev: Option<f32>,
     // Reusable scratch buffers (no per-frame allocation).
     window: Vec<f32>,
     feature: Vec<f32>,
@@ -101,6 +109,7 @@ impl OnlineFbank {
             input_finished: false,
             waveform_offset: 0,
             waveform_remainder: Vec::new(),
+            preemph_prev: None,
             window: vec![0.0; padded],
             feature: vec![0.0; dim],
         }
@@ -144,6 +153,24 @@ impl OnlineFbank {
         );
 
         self.waveform_remainder.extend_from_slice(waveform);
+        if self.computer.opts().frame_opts.center
+            && self.computer.opts().frame_opts.preemph_coeff != 0.0
+        {
+            // Centered mode: waveform-level pre-emphasis (torchaudio/NeMo
+            // convention) applied exactly once per sample across chunk
+            // boundaries; the zero padding added at frame extraction never
+            // participates in the difference.
+            let coeff = self.computer.opts().frame_opts.preemph_coeff;
+            let start = self.waveform_remainder.len() - waveform.len();
+            for i in start..self.waveform_remainder.len() {
+                let raw = self.waveform_remainder[i];
+                self.waveform_remainder[i] = match self.preemph_prev {
+                    Some(p) => raw - coeff * p,
+                    None => raw, // first sample of the signal stays untouched
+                };
+                self.preemph_prev = Some(raw);
+            }
+        }
         self.compute_features();
     }
 
@@ -192,9 +219,16 @@ impl OnlineFbank {
         }
 
         // Discard any portion of the signal that will not be necessary to
-        // compute frames in the future.
+        // compute frames in the future. Centered frames may start before the
+        // signal (their leading samples are zero-padding), so only the
+        // physical part (`max(first, 0)`) counts as discardable.
         let first_sample_of_next_frame = first_sample_of_frame(num_frames_new, &frame_opts);
-        let samples_to_discard = first_sample_of_next_frame - self.waveform_offset;
+        let discard_from = if frame_opts.center {
+            first_sample_of_next_frame.max(0)
+        } else {
+            first_sample_of_next_frame
+        };
+        let samples_to_discard = discard_from - self.waveform_offset;
 
         if samples_to_discard > 0 {
             let samples_to_discard = samples_to_discard as usize;

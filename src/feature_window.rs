@@ -79,9 +79,15 @@ impl FeatureWindowFunction {
 }
 
 /// First sample of the `frame`-th frame.
+///
+/// With `center == true` the window of frame `t` is centered on sample
+/// `t * frame_shift`, so the first sample is `t * frame_shift -
+/// window_size / 2` (negative values for early frames read as zero).
 pub fn first_sample_of_frame(frame: i32, opts: &FrameExtractionOptions) -> i64 {
     let frame_shift = opts.window_shift() as i64;
-    if opts.snip_edges {
+    if opts.center {
+        frame as i64 * frame_shift - opts.window_size() as i64 / 2
+    } else if opts.snip_edges {
         frame as i64 * frame_shift
     } else {
         let midpoint_of_frame = frame_shift * frame as i64 + frame_shift / 2;
@@ -92,10 +98,24 @@ pub fn first_sample_of_frame(frame: i32, opts: &FrameExtractionOptions) -> i64 {
 /// Number of frames extractable from `num_samples` samples.
 ///
 /// `flush` should be true for offline extraction; it matters only when
-/// `snip_edges == false`.
+/// `snip_edges == false`. With `center == true` the count follows the
+/// torchaudio `center=True` convention (`1 + num_samples / frame_shift`,
+/// truncating division) regardless of `flush`.
 pub fn num_frames(num_samples: i64, opts: &FrameExtractionOptions, flush: bool) -> i32 {
     let frame_shift = opts.window_shift() as i64;
     let frame_length = opts.window_size() as i64;
+
+    if opts.center {
+        let mut num = (1 + num_samples / frame_shift) as i32;
+        if !flush {
+            // Online: a frame whose window extends past the received signal
+            // needs future samples; defer it until they arrive (or flush).
+            while num > 0 && first_sample_of_frame(num - 1, opts) + frame_length > num_samples {
+                num -= 1;
+            }
+        }
+        return num;
+    }
 
     if opts.snip_edges {
         // HTK-like: all frames must fit completely into the waveform and the
@@ -176,9 +196,9 @@ pub fn extract_window(
     let start_sample = first_sample_of_frame(frame, opts);
     let end_sample = start_sample + frame_length as i64;
 
-    if opts.snip_edges {
+    if opts.snip_edges && !opts.center {
         assert!(start_sample >= sample_offset && end_sample <= num_samples);
-    } else {
+    } else if !opts.center {
         assert!(sample_offset == 0 || start_sample >= sample_offset);
     }
 
@@ -188,7 +208,19 @@ pub fn extract_window(
     let wave_start = (start_sample - sample_offset) as i32;
     let wave_end = wave_start + frame_length;
 
-    if wave_start >= 0 && wave_end <= wave.len() as i32 {
+    if opts.center {
+        // Centered framing zero-pads at the boundaries (torchaudio
+        // `center=True`), unlike the Kaldi reflection. Existence checks use
+        // absolute sample coordinates: `wave` starts at `sample_offset`.
+        for (s, slot) in window[..frame_length as usize].iter_mut().enumerate() {
+            let idx_abs = sample_offset + wave_start as i64 + s as i64;
+            *slot = if idx_abs >= 0 && idx_abs < num_samples {
+                wave[(idx_abs - sample_offset) as usize]
+            } else {
+                0.0
+            };
+        }
+    } else if wave_start >= 0 && wave_end <= wave.len() as i32 {
         window[..frame_length as usize]
             .copy_from_slice(&wave[wave_start as usize..wave_end as usize]);
     } else {
@@ -238,7 +270,13 @@ pub fn process_window(
         *le = energy.ln();
     }
 
-    if opts.preemph_coeff != 0.0 {
+    if opts.preemph_coeff != 0.0 && !opts.center {
+        // Kaldi per-frame pre-emphasis. Centered mode (`center == true`)
+        // follows the torchaudio/NeMo convention instead: pre-emphasis runs
+        // at the waveform level (see `OnlineFbank::accept_waveform`), so the
+        // zero padding added at the boundaries never participates in the
+        // difference, and re-applying it per frame here would smear the last
+        // real samples of each frame into the padding.
         preemphasize(frame, opts.preemph_coeff);
     }
 

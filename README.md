@@ -18,7 +18,8 @@
 - **Streaming-first** — `accept_waveform` takes chunks of any size (down to a single sample), frames are ready as soon as they are complete, and `get_frame(i)` returns a borrowed `&[f32]` with no per-frame allocation. Streaming unboundedly? `pop(n)` releases the oldest frames and keeps memory flat.
 - **Fast** — ~3–4.5× the C++ reference at identical inputs and options (33-case benchmark suite; long audio and production configs cluster at 3.0×–4.4×). Main source of the gap: rustfft plans once and reuses the plan, while kaldi-native-fbank's `Rfft` re-allocates a kiss_fft plan every frame.
 - **Every knob carried over** — 7 window types (a real enum with `FromStr` / `Display`), snip-edges vs reflection padding, energy dimensions (`use_energy` / `raw_energy` / `htk_compat`), log vs linear filterbanks, power vs magnitude spectra, Kaldi/HTK vs librosa mel style (incl. slaney norm), VTLN frequency bounds, non-power-of-two window lengths, and a fixed-seed dither for reproducible output.
-- **Tested hard** — **130** `cargo test` tests (unit, edge-case, golden, property/fuzz) plus a **604-case** end-to-end consistency matrix against the locally built C++ reference: `PASS=604 FAIL=0`.
+- **Centered framing (new in 0.2.0)** — `frame_opts.center = true` follows the `torch.stft` / torchaudio / NeMo `center=True` convention: zero-padding at both ends, windows centered on the frame-shift grid, and torchaudio-compatible frame counts. An extension beyond the Kaldi C++ reference; pairs with the librosa/slaney mel style for drop-in NeMo `FilterbankFeatures` frontends.
+- **Tested hard** — **135** `cargo test` tests (unit, edge-case, golden, property/fuzz, centered-framing compatibility) plus a **604-case** end-to-end consistency matrix against the locally built C++ reference: `PASS=604 FAIL=0`.
 
 ## 📦 Installation
 
