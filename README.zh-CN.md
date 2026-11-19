@@ -18,8 +18,10 @@
 - **流式优先** —— `accept_waveform` 接受任意大小的分块（最小 1 个样本），帧一经完整即可读取，`get_frame(i)` 返回借用的 `&[f32]`，无逐帧堆分配。需要无限时长流式？`pop(n)` 释放最旧的帧，内存保持平稳。
 - **更快** —— 相同输入、相同配置下，速度约为 C++ 参考实现的 **3~4.5 倍**（33 用例基准；长音频与生产配置集中在 3.0×~4.4×）。差距主因：rustfft 一次规划终身复用，而 kaldi-native-fbank 的 `Rfft` 每帧重新分配 kiss_fft plan。
 - **配置项全量保留** —— 7 种窗函数（真枚举，带 `FromStr` / `Display`）、snip-edges 与反射补边、能量维度（`use_energy` / `raw_energy` / `htk_compat`）、log 与线性滤波器组、功率谱与幅度谱、Kaldi/HTK 与 librosa 两种 mel 风格（含 slaney 归一化）、VTLN 频率边界、非 2 的幂窗长、固定种子 dither（输出可复现）。
-- **居中分帧（0.2.0 新增）** —— `frame_opts.center = true` 遵循 `torch.stft` / torchaudio / NeMo 的 `center=True` 约定：两端零填充、窗中心对齐帧移网格、帧数与 torchaudio 兼容。这是超出 Kaldi C++ 参考的扩展；配合 librosa/slaney mel 风格即可作为 NeMo `FilterbankFeatures` 前端的直接替代。
-- **测试扎实** —— **135** 个 `cargo test` 测试（单元 / 边界 / golden / 属性模糊 / 居中分帧兼容性）+ 对本机构建 C++ 参考的 **604 用例**端到端一致性矩阵：`PASS=604 FAIL=0`。
+- **居中分帧（0.2.0 新增）** —— `frame_opts.center = true` 遵循 `torch.stft` / torchaudio / NeMo 的 `center=True` 约定：窗中心对齐帧移网格、帧数与 torchaudio 兼容。这是超出 Kaldi C++ 参考的扩展；配合 librosa/slaney mel 风格即可作为 NeMo `FilterbankFeatures` 前端的直接替代。
+- **中心填充模式（0.3.0 新增）** —— `frame_opts.center_pad_mode` 选择居中分帧的边界填充：`Constant`（零填充，torchaudio / NeMo）或 `Reflect`（不含边界的镜像，`numpy.pad(..., mode="reflect")` / librosa / Whisper）。
+- **模型预设（0.3.0 新增）** —— `FbankOptions::whisper(n_mels)` 一次构造完整的 Whisper / Qwen3-ASR 特征配方：periodic Hann、400 点窗 / 160 点帧移、400 点 FFT、反射填充的居中分帧、librosa/slaney mel、功率谱、线性输出（Whisper 的 log 归一化仍由调用方完成）。
+- **测试扎实** —— **140** 个 `cargo test` 测试（单元 / 边界 / golden / 属性模糊 / 居中分帧与反射填充兼容性）+ 对本机构建 C++ 参考的 **604 用例**端到端一致性矩阵：`PASS=604 FAIL=0`。
 
 ## 📦 安装
 
