@@ -47,6 +47,6 @@ pub use feature_window::{
 pub use mel::{MelBanks, inverse_mel_scale, inverse_mel_scale_slaney, mel_scale, mel_scale_slaney};
 pub use online::{OnlineFbank, RecyclingVector, compute_fbank};
 pub use options::{
-    FbankOptions, FrameExtractionOptions, MelBanksOptions, WindowType,
+    CenterPadMode, FbankOptions, FrameExtractionOptions, MelBanksOptions, WindowType,
     round_up_to_nearest_power_of_two,
 };

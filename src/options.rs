@@ -14,6 +14,20 @@ pub fn round_up_to_nearest_power_of_two(mut n: i32) -> i32 {
     n + 1
 }
 
+/// Padding mode for centered framing (`center == true`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CenterPadMode {
+    /// Zero-pad the signal boundaries — the torchaudio `center=True` /
+    /// torch.stft / NeMo convention.
+    #[default]
+    Constant,
+    /// Mirror the signal at the boundaries without repeating the edge
+    /// sample — the `numpy.pad(..., mode="reflect")` / librosa / Whisper
+    /// convention. Degenerate signals shorter than two samples read as
+    /// their single sample.
+    Reflect,
+}
+
 /// Options for frame extraction: sample rate, frame shift / length, dithering,
 /// DC removal, pre-emphasis, window type, edge sniping.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,6 +70,15 @@ pub struct FrameExtractionOptions {
     /// Defaults to `false` (plain Kaldi framing). This is an extension
     /// beyond the C++ reference, which has no centered mode.
     pub center: bool,
+    /// Boundary padding used by centered framing (ignored when
+    /// `center == false`, where plain Kaldi framing applies its own
+    /// edge-inclusive reflection).
+    ///
+    /// [`CenterPadMode::Constant`] zero-pads (torchaudio / NeMo);
+    /// [`CenterPadMode::Reflect`] mirrors the signal edge-exclusively
+    /// (`numpy.pad(..., mode="reflect")`, librosa / Whisper). Defaults to
+    /// [`CenterPadMode::Constant`].
+    pub center_pad_mode: CenterPadMode,
     /// Seed for the dithering RNG.
     ///
     /// Rust extension: the C++ reference seeds its dithering RNG
@@ -79,6 +102,7 @@ impl Default for FrameExtractionOptions {
             blackman_coeff: 0.42,
             snip_edges: true,
             center: false,
+            center_pad_mode: CenterPadMode::Constant,
             dither_seed: 27437,
         }
     }
@@ -274,6 +298,61 @@ impl Default for FbankOptions {
             use_log_fbank: true,
             use_power: true,
         }
+    }
+}
+
+impl FbankOptions {
+    /// Whisper-style log-mel options — the feature definition shared by
+    /// Whisper and Qwen3-ASR: 400-sample window / 160-sample shift
+    /// (25 ms / 10 ms @ 16 kHz), periodic Hann window, power spectrum,
+    /// `n_mels` librosa/slaney mel bins over 0-8 kHz, no dither /
+    /// pre-emphasis / DC removal, centered framing with reflect padding
+    /// (`numpy.pad(..., mode="reflect")`), and linear (un-logged)
+    /// filterbank output.
+    ///
+    /// The Whisper post-processing (`log10(max(x, 1e-10))`, dynamic
+    /// `max - 8` floor, `(x + 4) / 4` scaling) is model-recipe logic and is
+    /// intentionally left to the caller.
+    ///
+    /// `n_mels` is 80 for Whisper small and below, 128 for large / turbo /
+    /// Qwen3-ASR.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n_mels` is zero or exceeds `i32::MAX`.
+    pub fn whisper(n_mels: usize) -> Self {
+        assert!(
+            n_mels > 0 && n_mels <= i32::MAX as usize,
+            "n_mels must be in 1..={}",
+            i32::MAX
+        );
+        let mut opts = Self {
+            mel_opts: MelBanksOptions {
+                num_bins: n_mels as i32,
+                ..MelBanksOptions::default()
+            },
+            ..Self::default()
+        };
+        let f = &mut opts.frame_opts;
+        f.samp_freq = 16000.0;
+        f.frame_shift_ms = 10.0;
+        f.frame_length_ms = 25.0; // 400 samples
+        f.dither = 0.0;
+        f.preemph_coeff = 0.0;
+        f.remove_dc_offset = false;
+        f.window_type = WindowType::Hann; // periodic (2*pi*n / N)
+        f.round_to_power_of_two = false; // 400-point FFT, not rounded to 512
+        f.snip_edges = true; // superseded by `center`, set for consistency
+        f.center = true;
+        f.center_pad_mode = CenterPadMode::Reflect;
+        opts.mel_opts.low_freq = 0.0;
+        opts.mel_opts.high_freq = 8000.0;
+        opts.mel_opts.is_librosa = true;
+        opts.mel_opts.norm = "slaney".to_string();
+        opts.mel_opts.use_slaney_mel_scale = true;
+        opts.use_power = true;
+        opts.use_log_fbank = false;
+        opts
     }
 }
 

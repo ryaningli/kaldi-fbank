@@ -7,7 +7,7 @@
 
 use std::f64::consts::PI;
 
-use crate::options::{FrameExtractionOptions, WindowType};
+use crate::options::{CenterPadMode, FrameExtractionOptions, WindowType};
 
 /// Computes a window function. `blackman_coeff` is only used for
 /// [`WindowType::Blackman`].
@@ -175,11 +175,45 @@ fn preemphasize(d: &mut [f32], preemph_coeff: f32) {
     d[0] -= preemph_coeff * d[0];
 }
 
+/// Maps an arbitrary (possibly out-of-range) sample index onto a signal of
+/// `n` samples by edge-exclusive mirroring — the
+/// `numpy.pad(..., mode="reflect")` semantics: the signal is mirrored about
+/// its first and last samples, which are never repeated, giving the index
+/// sequence period `2 * (n - 1)`.
+///
+/// `n == 1` degenerates to a constant signal. Returns an index in
+/// `0..n` (as `i64` so callers can subtract signed offsets safely).
+fn reflect_index(i: i64, n: i64) -> i64 {
+    debug_assert!(n > 0, "reflect_index requires a non-empty signal");
+    if n == 1 {
+        return 0;
+    }
+    let period = 2 * (n - 1);
+    let m = i.rem_euclid(period);
+    if m < n { m } else { period - m }
+}
+
 /// Extracts a windowed frame (with reflection at the boundaries), then runs
 /// `process_window` on it.
 ///
 /// `window` must have length `opts.padded_window_size()`; the tail beyond
 /// `opts.window_size()` is zeroed.
+///
+/// With `center == true` the boundary samples come from
+/// `opts.center_pad_mode` instead: `Constant` zero-pads, `Reflect` mirrors
+/// the signal edge-exclusively (`numpy.pad(..., mode="reflect")`).
+///
+/// # Panics
+///
+/// Panics if `wave` is empty, if `window.len()` differs from
+/// `opts.padded_window_size()`, or — in `Reflect` mode — if the mirror
+/// source of an out-of-range sample lies outside `wave` (i.e. was already
+/// discarded). Mirrors of out-of-range samples are derived from the signal
+/// head / tail, and [`crate::online::OnlineFbank`] only discards head
+/// samples once no frame needs them anymore, so streaming use through
+/// `OnlineFbank` upholds this precondition. The precondition is also what
+/// makes chunked feeding bitwise-identical to batch extraction (pinned by
+/// the `center_reflect_streaming_matches_batch` test).
 pub fn extract_window(
     sample_offset: i64,
     wave: &[f32],
@@ -209,16 +243,37 @@ pub fn extract_window(
     let wave_end = wave_start + frame_length;
 
     if opts.center {
-        // Centered framing zero-pads at the boundaries (torchaudio
-        // `center=True`), unlike the Kaldi reflection. Existence checks use
+        // Centered framing pads at the boundaries (torchaudio `center=True`
+        // convention), unlike the Kaldi reflection. Existence checks use
         // absolute sample coordinates: `wave` starts at `sample_offset`.
-        for (s, slot) in window[..frame_length as usize].iter_mut().enumerate() {
-            let idx_abs = sample_offset + wave_start as i64 + s as i64;
-            *slot = if idx_abs >= 0 && idx_abs < num_samples {
-                wave[(idx_abs - sample_offset) as usize]
-            } else {
-                0.0
-            };
+        //
+        // Mirror reads (Reflect) only occur for the first / last frames,
+        // whose mirror sources are the signal head / tail — still in `wave`
+        // at that point, because head samples are only discarded once no
+        // frame needs them anymore. The per-mode loops keep the pad-mode
+        // check out of the per-sample path.
+        match opts.center_pad_mode {
+            CenterPadMode::Constant => {
+                for (s, slot) in window[..frame_length as usize].iter_mut().enumerate() {
+                    let idx_abs = sample_offset + wave_start as i64 + s as i64;
+                    *slot = if idx_abs >= 0 && idx_abs < num_samples {
+                        wave[(idx_abs - sample_offset) as usize]
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            CenterPadMode::Reflect => {
+                for (s, slot) in window[..frame_length as usize].iter_mut().enumerate() {
+                    let idx_abs = sample_offset + wave_start as i64 + s as i64;
+                    *slot = if idx_abs >= 0 && idx_abs < num_samples {
+                        wave[(idx_abs - sample_offset) as usize]
+                    } else {
+                        let reflected = reflect_index(idx_abs, num_samples);
+                        wave[(reflected - sample_offset) as usize]
+                    };
+                }
+            }
         }
     } else if wave_start >= 0 && wave_end <= wave.len() as i32 {
         window[..frame_length as usize]
@@ -729,5 +784,46 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(a.rand_gauss(), b.rand_gauss());
         }
+    }
+
+    // --- reflect_index (center + Reflect padding) --------------------------
+
+    #[test]
+    fn reflect_index_edge_exclusive_mirror() {
+        // n = 4: sequence ... a2 a3 | a0 a1 a2 a3 | a2 a1 ... (period 2*(n-1))
+        let n = 4;
+        assert_eq!(super::reflect_index(-1, n), 1);
+        assert_eq!(super::reflect_index(-2, n), 2);
+        assert_eq!(super::reflect_index(-3, n), 3);
+        assert_eq!(super::reflect_index(-4, n), 2);
+        assert_eq!(super::reflect_index(4, n), 2);
+        assert_eq!(super::reflect_index(5, n), 1);
+        assert_eq!(super::reflect_index(6, n), 0);
+        assert_eq!(super::reflect_index(7, n), 1);
+        // n = 1 degenerates to a constant signal.
+        assert_eq!(super::reflect_index(-5, 1), 0);
+        assert_eq!(super::reflect_index(9, 1), 0);
+    }
+
+    #[test]
+    fn extract_window_center_reflect_pads_by_mirroring() {
+        let mut o = opts16k();
+        o.center = true;
+        o.center_pad_mode = crate::options::CenterPadMode::Reflect;
+        // Force a tiny window (4 samples) so the whole frame is boundary.
+        // Rectangular window + no DC removal / dither keeps the raw padded
+        // samples visible after process_window.
+        o.frame_length_ms = 0.25;
+        o.round_to_power_of_two = false;
+        o.window_type = WindowType::Rectangular;
+        o.remove_dc_offset = false;
+        o.dither = 0.0;
+        let wf = FeatureWindowFunction::from_frame_opts(&o);
+        let wave: Vec<f32> = vec![10.0, 20.0, 30.0];
+        let mut win = vec![0.0f32; o.padded_window_size() as usize];
+        extract_window(0, &wave, 0, &o, &wf, &mut win, None);
+        // Window covers [-2, 2) -> [a2, a1, a0, a1] mirrored about both
+        // ends (period 2*(3-1)=4: -2 -> 2, -1 -> 1).
+        assert_eq!(&win[..4], &[30.0, 20.0, 10.0, 20.0]);
     }
 }

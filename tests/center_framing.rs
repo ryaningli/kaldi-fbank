@@ -9,7 +9,7 @@
 //! reference STFT written directly against the torch semantics, and checks
 //! the filterbank energies against it on synthetic signals.
 
-use kaldi_fbank::{FbankOptions, OnlineFbank};
+use kaldi_fbank::{CenterPadMode, FbankOptions, OnlineFbank, WindowType, compute_fbank};
 
 /// NeMo/NeMo-style log-mel options matching a typical `FilterbankFeatures`
 /// configuration: 25 ms / 10 ms frames, periodic-free symmetric Hann window,
@@ -359,5 +359,135 @@ fn centered_streaming_matches_batch_across_chunk_boundaries() {
             batch.get_frame(t),
             "frame {t} differs between streaming and batch"
         );
+    }
+}
+
+// --- Reflect padding (Whisper convention) ---------------------------------
+
+/// Whisper-style log-mel recipe: periodic Hann, no dither / pre-emphasis /
+/// DC removal, 400-sample window / 160-sample shift, 400-point FFT, 128
+/// librosa/slaney mel bins over 0-8 kHz, power spectrum, linear output.
+fn whisper_style_opts() -> FbankOptions {
+    let mut o = FbankOptions::default();
+    o.frame_opts.samp_freq = 16000.0;
+    o.frame_opts.frame_shift_ms = 10.0;
+    o.frame_opts.frame_length_ms = 25.0;
+    o.frame_opts.dither = 0.0;
+    o.frame_opts.preemph_coeff = 0.0;
+    o.frame_opts.remove_dc_offset = false;
+    o.frame_opts.window_type = WindowType::Hann;
+    o.frame_opts.round_to_power_of_two = false;
+    o.frame_opts.snip_edges = true;
+    o.mel_opts.num_bins = 128;
+    o.mel_opts.low_freq = 0.0;
+    o.mel_opts.high_freq = 8000.0;
+    o.mel_opts.is_librosa = true;
+    o.mel_opts.norm = "slaney".to_string();
+    o.mel_opts.use_slaney_mel_scale = true;
+    o.use_power = true;
+    o.use_log_fbank = false;
+    o
+}
+
+/// Edge-exclusive periodic mirror — `numpy.pad(wave, pad, mode="reflect")`,
+/// written from the definition (index space has period `2 * (n - 1)`).
+fn reflect_pad(wave: &[f32], pad: usize) -> Vec<f32> {
+    let n = wave.len() as i64;
+    let reflect = |i: i64| -> usize {
+        if n == 1 {
+            return 0;
+        }
+        let period = 2 * (n - 1);
+        let m = i.rem_euclid(period);
+        if m < n {
+            m as usize
+        } else {
+            (period - m) as usize
+        }
+    };
+    (-(pad as i64)..(n + pad as i64))
+        .map(|i| wave[reflect(i)])
+        .collect()
+}
+
+/// `center + Reflect` framing must be point-for-point identical to the
+/// equivalent manual recipe: mirror-pad the waveform yourself and feed it
+/// through plain `snip_edges` framing. This is the Whisper/log-mel path.
+#[test]
+fn center_reflect_matches_manual_pad_with_snip_edges() {
+    for len in [100, 1000, 16037, 48000] {
+        let wave = synthetic_wave(len);
+
+        let mut centered = whisper_style_opts();
+        centered.frame_opts.center = true;
+        centered.frame_opts.center_pad_mode = CenterPadMode::Reflect;
+        let got = compute_fbank(&centered, &wave);
+
+        let manual = whisper_style_opts();
+        let want = compute_fbank(&manual, &reflect_pad(&wave, 200));
+
+        assert_eq!(got.len(), want.len(), "len={len}: frame count must match");
+        for (f, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g, w, "len={len}: frame {f} must match bitwise");
+        }
+    }
+}
+
+/// The `FbankOptions::whisper` preset must be exactly the manual Whisper
+/// recipe (guarded by `PartialEq` so it can never silently drift).
+#[test]
+fn whisper_preset_matches_manual_recipe() {
+    let preset = FbankOptions::whisper(128);
+    let manual = {
+        let mut o = whisper_style_opts();
+        o.frame_opts.center = true;
+        o.frame_opts.center_pad_mode = CenterPadMode::Reflect;
+        o
+    };
+    assert_eq!(preset, manual);
+    assert_eq!(FbankOptions::whisper(80), {
+        let mut o = manual;
+        o.mel_opts.num_bins = 80;
+        o
+    });
+}
+
+/// Centered + Reflect framing must be chunk-independent: feeding the signal
+/// in arbitrary chunk sizes must produce bitwise-identical frames to a
+/// single-shot `compute_fbank`. This pins the streaming invariant that the
+/// mirror sources of the leading (negative-index) frames are still in the
+/// ring buffer when those frames are computed, across discard boundaries.
+#[test]
+fn center_reflect_streaming_matches_batch() {
+    let wave = synthetic_wave(8000);
+
+    let mut opts = whisper_style_opts();
+    opts.frame_opts.center = true;
+    opts.frame_opts.center_pad_mode = CenterPadMode::Reflect;
+    let batch = compute_fbank(&opts, &wave);
+
+    // 1 exercises the smallest possible chunks (frame deferred until enough
+    // samples arrive); 160 / 400 align with hop / window; 1234 is an
+    // awkward non-aligned size that straddles discard boundaries.
+    for chunk in [1, 7, 160, 400, 1234] {
+        let mut fbank = OnlineFbank::new(opts.clone());
+        for part in wave.chunks(chunk) {
+            fbank.accept_waveform(16000.0, part);
+        }
+        fbank.input_finished();
+
+        let n = fbank.num_frames_ready();
+        assert_eq!(
+            n as usize,
+            batch.len(),
+            "chunk={chunk}: frame count must match"
+        );
+        for (i, want) in batch.iter().enumerate().take(n as usize) {
+            assert_eq!(
+                fbank.get_frame(i as i32),
+                want.as_slice(),
+                "chunk={chunk}: frame {i} must match bitwise"
+            );
+        }
     }
 }
